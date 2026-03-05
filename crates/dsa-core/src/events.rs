@@ -31,14 +31,34 @@ pub struct DerivedMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraverseErrorKind {
+
+    // fs::(sym)metadata failed for a path.
     StatFailed,
+
+    // fs::read_dir failed for a directory we attempted to expand.
     ExpandFailed,
+
+    // iterating entries of a fs::read_dir produced an error.
     ReadDirEntryFailed,
 }
 
 #[derive(Debug, Clone)]
 pub enum TraverseEvent {
-    Entry {
+
+    // emitted only for directories that were successfully expanded.
+    EnterDir {
+        path: PathBuf,
+        raw: OsRawMetadata,
+    },
+
+    // emitted for non-directories
+    File {
+        path: PathBuf,
+        raw: OsRawMetadata,
+    },
+
+    // emitted only for directories that were successfully expanded.
+    ExitDir {
         path: PathBuf,
         raw: OsRawMetadata,
     },
