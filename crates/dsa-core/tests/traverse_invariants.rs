@@ -199,3 +199,232 @@ fn fail_fast_stops_after_first_error_event() {
     assert!(!events.is_empty());
     assert!(matches!(events.last().unwrap(), TraverseEvent::Error { .. }), "expected traversal to stop on an Error in fail-fast mode");
 }
+
+#[cfg(unix)]
+#[test]
+fn descendants_of_a_bracketed_directory_appear_strictly_between_enter_and_exit() {
+    // Arrange
+    let base = make_tmp_base("descendants_nested_between_enter_exit");
+    cleanup_dir(&base);
+
+    mk_dir(&base);
+    let a = base.join("a");
+    let b = a.join("b");
+    let c = base.join("c");
+
+    mk_dir(&a);
+    mk_dir(&b);
+    mk_dir(&c);
+
+    let f1 = a.join("a.txt");
+    let f2 = b.join("b.txt");
+    let f3 = c.join("c.txt");
+    let f4 = base.join("root.txt");
+
+    mk_file(&f1, b"a");
+    mk_file(&f2, b"b");
+    mk_file(&f3, b"c");
+    mk_file(&f4, b"root");
+
+    // Act
+    let cfg = TraverseConfig::default();
+    let events = collect_events(&base, &cfg);
+
+    cleanup_dir(&base);
+
+    // Helper: index of EnterDir(path)
+    let enter_idx = |target: &PathBuf| {
+        events.iter().position(|e| {
+            matches!(e, TraverseEvent::EnterDir { path, .. } if path == target)
+        }).unwrap_or_else(|| panic!("missing EnterDir for {:?}", target))
+    };
+
+    // Helper: index of ExitDir(path)
+    let exit_idx = |target: &PathBuf| {
+        events.iter().position(|e| {
+            matches!(e, TraverseEvent::ExitDir { path, .. } if path == target)
+        }).unwrap_or_else(|| panic!("missing ExitDir for {:?}", target))
+    };
+
+    let a_enter = enter_idx(&a);
+    let a_exit = exit_idx(&a);
+
+    assert!(a_enter < a_exit, "EnterDir(a) must occur before ExitDir(a)");
+
+    // All descendants of `a` must lie strictly inside (a_enter, a_exit).
+    for descendant in [&b, &f1, &f2] {
+        let idx = events.iter().position(|e| match e {
+            TraverseEvent::EnterDir { path, .. } => path == descendant,
+            TraverseEvent::ExitDir { path, .. } => path == descendant,
+            TraverseEvent::File { path, .. } => path == descendant,
+            TraverseEvent::Error { path, .. } => path == descendant,
+            TraverseEvent::Skipped { path, .. } => path == descendant,
+        });
+
+        let idx = idx.unwrap_or_else(|| panic!("missing event for descendant {:?}", descendant));
+
+        assert!(
+            a_enter < idx && idx < a_exit,
+            "descendant {:?} must occur strictly between EnterDir(a) and ExitDir(a)",
+            descendant
+        );
+    }
+
+    // Non-descendants of `a` must not lie strictly inside (a_enter, a_exit).
+    for non_descendant in [&c, &f3, &f4] {
+        let idx = events.iter().position(|e| match e {
+            TraverseEvent::EnterDir { path, .. } => path == non_descendant,
+            TraverseEvent::ExitDir { path, .. } => path == non_descendant,
+            TraverseEvent::File { path, .. } => path == non_descendant,
+            TraverseEvent::Error { path, .. } => path == non_descendant,
+            TraverseEvent::Skipped { path, .. } => path == non_descendant,
+        });
+
+        let idx = idx.unwrap_or_else(|| panic!("missing event for non-descendant {:?}", non_descendant));
+
+        assert!(
+            !(a_enter < idx && idx < a_exit),
+            "non-descendant {:?} must not occur inside the bracket interval of {:?}",
+            non_descendant,
+            a
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn path_lexicographic_ordering_orders_siblings_deterministically() {
+    use dsa_core::policy::ChildOrdering;
+
+    // Arrange
+    let base = make_tmp_base("path_lexicographic_ordering");
+    cleanup_dir(&base);
+
+    mk_dir(&base);
+    mk_file(&base.join("z.txt"), b"z");
+    mk_file(&base.join("a.txt"), b"a");
+    mk_file(&base.join("m.txt"), b"m");
+
+    // Act
+    let mut cfg = TraverseConfig::default();
+    cfg.child_ordering = ChildOrdering::PathLexicographic;
+
+    let events = collect_events(&base, &cfg);
+
+    cleanup_dir(&base);
+
+    // Extract only files directly under base, in event order.
+    let seen: Vec<PathBuf> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            TraverseEvent::File { path, .. } if path.parent() == Some(base.as_path()) => Some(path),
+            _ => None,
+        })
+        .collect();
+
+    let expected = vec![
+        base.join("a.txt"),
+        base.join("m.txt"),
+        base.join("z.txt"),
+    ];
+
+    assert_eq!(seen, expected, "siblings should be emitted in lexicographic order");
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_entries_are_emitted_as_skipped_when_skip_hidden_is_enabled() {
+    // Arrange
+    let base = make_tmp_base("skip_hidden");
+    cleanup_dir(&base);
+
+    mk_dir(&base);
+    let hidden = base.join(".secret");
+    let visible = base.join("visible.txt");
+
+    mk_file(&hidden, b"hidden");
+    mk_file(&visible, b"visible");
+
+    let mut cfg = TraverseConfig::default();
+    cfg.skip_hidden = true;
+
+    // Act
+    let events = collect_events(&base, &cfg);
+
+    cleanup_dir(&base);
+
+    // Assert
+    let saw_hidden_skipped = events.iter().any(|e| {
+        matches!(
+            e,
+            TraverseEvent::Skipped { path, reason }
+                if *path == hidden && *reason == dsa_core::events::SkipReason::Hidden
+        )
+    });
+
+    let saw_hidden_file = events.iter().any(|e| {
+        matches!(e, TraverseEvent::File { path, .. } if *path == hidden)
+    });
+
+    let saw_visible_file = events.iter().any(|e| {
+        matches!(e, TraverseEvent::File { path, .. } if *path == visible)
+    });
+
+    assert!(saw_hidden_skipped, "expected hidden file to be skipped");
+    assert!(!saw_hidden_file, "hidden file should not be emitted as File when skipped");
+    assert!(saw_visible_file, "visible file should still be emitted as File");
+}
+
+
+#[cfg(unix)]
+#[test]
+fn hidden_directories_are_skipped_and_not_bracketed() {
+    // Arrange
+    let base = make_tmp_base("skip_hidden_dir");
+    cleanup_dir(&base);
+
+    mk_dir(&base);
+    let hidden_dir = base.join(".cache");
+    let child_inside = hidden_dir.join("x.txt");
+
+    mk_dir(&hidden_dir);
+    mk_file(&child_inside, b"x");
+
+    let mut cfg = TraverseConfig::default();
+    cfg.skip_hidden = true;
+
+    // Act
+    let events = collect_events(&base, &cfg);
+
+    cleanup_dir(&base);
+
+    // Assert
+    let saw_skipped = events.iter().any(|e| {
+        matches!(
+            e,
+            TraverseEvent::Skipped { path, reason }
+                if *path == hidden_dir && *reason == dsa_core::events::SkipReason::Hidden
+        )
+    });
+
+    let saw_enter = events.iter().any(|e| {
+        matches!(e, TraverseEvent::EnterDir { path, .. } if *path == hidden_dir)
+    });
+
+    let saw_exit = events.iter().any(|e| {
+        matches!(e, TraverseEvent::ExitDir { path, .. } if *path == hidden_dir)
+    });
+
+    let saw_child = events.iter().any(|e| match e {
+        TraverseEvent::File { path, .. } => *path == child_inside,
+        TraverseEvent::Skipped { path, .. } => *path == child_inside,
+        TraverseEvent::Error { path, .. } => *path == child_inside,
+        TraverseEvent::EnterDir { path, .. } => *path == child_inside,
+        TraverseEvent::ExitDir { path, .. } => *path == child_inside,
+    });
+
+    assert!(saw_skipped, "expected hidden directory to be skipped");
+    assert!(!saw_enter, "skipped hidden directory must not be bracketed");
+    assert!(!saw_exit, "skipped hidden directory must not be bracketed");
+    assert!(!saw_child, "children of skipped directory must not appear");
+}

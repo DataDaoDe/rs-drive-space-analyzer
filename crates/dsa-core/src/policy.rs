@@ -23,3 +23,12 @@ impl Default for ErrorPolicy {
         }
     }
 }
+
+/// How children of a directory are ordered before traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildOrdering {
+    /// Preserve filesystem / OS iteration order.
+    Unspecified,
+    /// Sort children by full path lexicographically.
+    PathLexicographic,
+}

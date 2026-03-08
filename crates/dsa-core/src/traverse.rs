@@ -1,5 +1,5 @@
-use crate::events::{FsEntryKind, OsRawMetadata, TraverseEvent, TraverseErrorKind};
-use crate::policy::{ErrorPolicy, ErrorReaction};
+use crate::events::{FsEntryKind, OsRawMetadata, TraverseEvent, TraverseErrorKind, SkipReason};
+use crate::policy::{ChildOrdering, ErrorPolicy, ErrorReaction};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,6 +9,13 @@ use std::collections::VecDeque;
 pub struct TraverseConfig {
     pub follow_symlinks: bool,
     pub error_policy: ErrorPolicy,
+    pub child_ordering: ChildOrdering,
+
+    /// If true, entries whose file name begins with '.' are skipped.
+    pub skip_hidden: bool,
+
+    /// If true and follow_symlinks == false, symlinks are skipped instead of emitted as File.
+    pub skip_symlinks_when_not_following: bool,
 }
 
 impl Default for TraverseConfig {
@@ -16,6 +23,9 @@ impl Default for TraverseConfig {
         Self {
             follow_symlinks: false,
             error_policy: ErrorPolicy::default(),
+            child_ordering: ChildOrdering::Unspecified,
+            skip_hidden: false,
+            skip_symlinks_when_not_following: false,
         }
     }
 }
@@ -82,6 +92,36 @@ fn should_halt(reaction: ErrorReaction) -> bool {
     matches!(reaction, ErrorReaction::FailFast)
 }
 
+fn order_children(children: &mut Vec<PathBuf>, cfg: &TraverseConfig) {
+    match cfg.child_ordering {
+        ChildOrdering::Unspecified => {}
+        ChildOrdering::PathLexicographic => {
+            children.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+        }
+    }
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
+}
+
+fn skip_reason(path: &Path, raw: &OsRawMetadata, cfg: &TraverseConfig) -> Option<SkipReason> {
+    if cfg.skip_hidden && is_hidden(path) {
+        return Some(SkipReason::Hidden);
+    }
+
+    if !cfg.follow_symlinks
+        && cfg.skip_symlinks_when_not_following
+        && raw.kind == FsEntryKind::Symlink
+    {
+        return Some(SkipReason::Symlink);
+    }
+
+    None
+}
 
 pub fn traverse(
     root: impl AsRef<Path>,
@@ -92,17 +132,19 @@ pub fn traverse(
 
     // DFS stack of directory frames
     let mut stack: Vec<DirFrame> = Vec::new();
-
     // output buffer so we can emit one event per iterator step cleanly
     let mut out: VecDeque<TraverseEvent> = VecDeque::new();
-
-    // if true, next call yields None
     let mut halted: bool = false;
     
     // initialization
     match raw_metadata(&root, &cfg) {
         Ok(raw) => {
-            if raw.kind == FsEntryKind::Directory {
+            if let Some(reason) = skip_reason(&root, &raw, &cfg) {
+                out.push_back(TraverseEvent::Skipped {
+                    path: root.clone(),
+                    reason,
+                });
+            } else if raw.kind == FsEntryKind::Directory {
                 match fs::read_dir(&root) {
                     Ok(rd) => {
                         let mut children = Vec::new();
@@ -121,6 +163,7 @@ pub fn traverse(
                                 }
                             }
                         }
+                        order_children(&mut children, &cfg);
 
                         // Policy A: only if expansion succeeded do we bracket.
                         stack.push(DirFrame {
@@ -194,6 +237,13 @@ pub fn traverse(
 
                 match raw_metadata(&child_path, &cfg) {
                     Ok(raw) => {
+                        if let Some(reason) = skip_reason(&child_path, &raw, &cfg) {
+                            return Some(TraverseEvent::Skipped {
+                                path: child_path,
+                                reason,
+                            });
+                        }
+
                         if raw.kind == FsEntryKind::Directory {
                             match fs::read_dir(&child_path) {
                                 Ok(rd) => {
@@ -213,6 +263,7 @@ pub fn traverse(
                                             }
                                         }
                                     }
+                                    order_children(&mut children, &cfg);
 
                                     // Policy A: only if expansion succeeded do we push a bracketed frame.
                                     stack.push(DirFrame {

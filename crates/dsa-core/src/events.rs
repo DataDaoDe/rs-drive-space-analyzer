@@ -42,6 +42,13 @@ pub enum TraverseErrorKind {
     ReadDirEntryFailed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    Hidden,
+    Symlink,
+    PredicateMatched,
+}
+
 #[derive(Debug, Clone)]
 pub enum TraverseEvent {
 
@@ -62,9 +69,16 @@ pub enum TraverseEvent {
         path: PathBuf,
         raw: OsRawMetadata,
     },
+
+    Skipped {
+        path: PathBuf,
+        reason: SkipReason,
+    },
+
     Error {
         path: PathBuf,
         kind: TraverseErrorKind,
         message: String,
     },
 }
+
